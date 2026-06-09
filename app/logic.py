@@ -1,258 +1,325 @@
 # app/logic.py
-import random
 import math
+import random
 from typing import Optional
 
 from app.schemas import Cell, Position, SetupResponse, PlayerTurnResponse
 
-BOARD_SIZE = 5
+GRID = 5
+ALTURA_VITORIA = 3   # subir até este nível vence o jogo
+ALTURA_MAXIMA = 4    # cúpula: ninguém pode ocupar nem construir acima
 
-# Professores de cada time
-TEAM_PROFESSORS = {
-    1: ["CLARO", "REY"],       # Turing
-    2: ["KARIN", "BEATRIZ"],   # Lovelace
+# Professores controlados por cada equipe
+PROFS_POR_EQUIPE = {
+    1: ("CLARO", "REY"),       # Turing
+    2: ("KARIN", "BEATRIZ"),   # Lovelace
 }
 
-# Pesos da Função de Avaliação
-WEIGHTS = {
-    "win_move": 10000.0,
-    "my_height": 22.0,         
-    "opp_height": -28.0,       
-    "center_control": 11.0,    
-    "mobility": 1.0            
+# Pesos da função de avaliação
+PESOS = {
+    "vitoria": 10_000.0,
+    "minha_altura": 22.0,
+    "altura_adversario": -28.0,
+    "controle_centro": 11.0,
+    "mobilidade": 1.0,
+    "potencial_subida": 4.0,   # estar ao lado de uma casa um nível acima é bom
 }
 
+
 # =========================================================
-# MÓDULO 1: FILTRO CSP (Satisfação de Restrições)
+# UTILITÁRIOS DE TABULEIRO
 # =========================================================
-def adjacent_cells(row: int, col: int) -> list[tuple[int, int]]:
-    """Retorna todas as casas vizinhas (incluindo diagonais) dentro do grid."""
-    cells = []
-    for dr in (-1, 0, 1):
+def equipe_adversaria(equipe: int) -> int:
+    return 2 if equipe == 1 else 1
+
+
+def vizinhas(linha: int, coluna: int):
+    """Gera as casas adjacentes (8 direções) que ficam dentro do grid."""
+    for dl in (-1, 0, 1):
         for dc in (-1, 0, 1):
-            if dr == 0 and dc == 0:
+            if dl == 0 and dc == 0:
                 continue
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-                cells.append((nr, nc))
-    return cells
+            nl, nc = linha + dl, coluna + dc
+            if 0 <= nl < GRID and 0 <= nc < GRID:
+                yield nl, nc
 
-def find_professor(board: list[list[Cell]], name: str) -> Optional[tuple[int, int]]:
-    """Encontra a posição (row, col) de um professor no tabuleiro."""
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            if board[r][c].professor == name:
-                return (r, c)
+
+def localizar(tabuleiro: list[list[Cell]], prof: str) -> Optional[tuple[int, int]]:
+    """Posição (linha, coluna) de um único professor, com saída antecipada."""
+    for l in range(GRID):
+        for c in range(GRID):
+            if tabuleiro[l][c].professor == prof:
+                return (l, c)
     return None
 
-def choose_setup(board: list[list[Cell]]) -> SetupResponse:
-    """Fase de posicionamento: escolhe o centro ou adjacências aleatórias."""
-    candidates = [
-        (r, c)
-        for r in range(BOARD_SIZE)
-        for c in range(BOARD_SIZE)
-        if board[r][c].level == 0 and board[r][c].professor is None
-    ]
-    # Tenta priorizar o centro no setup
-    center_candidates = [(r, c) for r, c in candidates if 1 <= r <= 3 and 1 <= c <= 3]
-    row, col = random.choice(center_candidates if center_candidates else candidates)
-    return SetupResponse(row=row, col=col)
 
-def get_legal_moves(board: list[list[Cell]], team_id: int) -> list[PlayerTurnResponse]:
-    """Gera todos os movimentos legais para a equipe atual (Filtro CSP)."""
-    legal_moves = []
-    
-    for professor in TEAM_PROFESSORS[team_id]:
-        pos = find_professor(board, professor)
-        if pos is None:
+def mapear_professores(tabuleiro: list[list[Cell]]) -> dict[str, tuple[int, int]]:
+    """Varre o tabuleiro UMA vez e devolve {nome: (linha, coluna)}."""
+    posicoes: dict[str, tuple[int, int]] = {}
+    for l in range(GRID):
+        for c in range(GRID):
+            prof = tabuleiro[l][c].professor
+            if prof is not None:
+                posicoes[prof] = (l, c)
+    return posicoes
+
+
+# =========================================================
+# FILTRO CSP: GERAÇÃO DE JOGADAS LEGAIS
+# =========================================================
+def jogadas_validas(
+    tabuleiro: list[list[Cell]],
+    equipe: int,
+    posicoes: Optional[dict[str, tuple[int, int]]] = None,
+) -> list[PlayerTurnResponse]:
+    """Todas as jogadas legais da equipe (mover + construir / mover para vencer)."""
+    if posicoes is None:
+        posicoes = mapear_professores(tabuleiro)
+
+    jogadas: list[PlayerTurnResponse] = []
+    for prof in PROFS_POR_EQUIPE[equipe]:
+        origem = posicoes.get(prof)
+        if origem is None:
             continue
+        ol, oc = origem
+        altura_atual = tabuleiro[ol][oc].level
 
-        cur_row, cur_col = pos
-        cur_level = board[cur_row][cur_col].level
+        for dl, dc in vizinhas(ol, oc):
+            destino = tabuleiro[dl][dc]
 
-        for dst_row, dst_col in adjacent_cells(cur_row, cur_col):
-            dst_cell = board[dst_row][dst_col]
+            # Restrições de movimento (CSP)
+            if destino.professor is not None:
+                continue
+            if destino.level >= ALTURA_MAXIMA:
+                continue
+            if destino.level > altura_atual + 1:
+                continue
 
-            # Restrições (CSP)
-            if dst_cell.professor is not None: continue
-            if dst_cell.level == 4: continue
-            if dst_cell.level > cur_level + 1: continue
-
-            # Se for vitória imediata (movimento para nível 3)
-            if dst_cell.level == 3:
-                legal_moves.append(PlayerTurnResponse(
-                    professor=professor,
-                    move_to=Position(row=dst_row, col=dst_col)
+            # Subir ao nível de vitória encerra a jogada (não constrói)
+            if destino.level == ALTURA_VITORIA:
+                jogadas.append(PlayerTurnResponse(
+                    professor=prof,
+                    move_to=Position(row=dl, col=dc),
                 ))
                 continue
 
-            # Movimentos normais que exigem mentoria (construção)
-            for men_row, men_col in adjacent_cells(dst_row, dst_col):
-                men_cell = board[men_row][men_col]
-                is_source = (men_row, men_col) == (cur_row, cur_col)
-                
-                if (men_cell.professor is None or is_source) and men_cell.level < 4:
-                    legal_moves.append(PlayerTurnResponse(
-                        professor=professor,
-                        move_to=Position(row=dst_row, col=dst_col),
-                        mentor_at=Position(row=men_row, col=men_col)
+            # Jogada normal: depois de mover, constrói (mentoria) numa casa
+            # adjacente ao destino. A própria origem é um alvo válido.
+            for ml, mc in vizinhas(dl, dc):
+                mentoria = tabuleiro[ml][mc]
+                eh_origem = (ml, mc) == (ol, oc)
+                if (mentoria.professor is None or eh_origem) and mentoria.level < ALTURA_MAXIMA:
+                    jogadas.append(PlayerTurnResponse(
+                        professor=prof,
+                        move_to=Position(row=dl, col=dc),
+                        mentor_at=Position(row=ml, col=mc),
                     ))
-                    
-    return legal_moves
+    return jogadas
 
-def count_legal_moves(board: list[list[Cell]], team_id: int) -> int:
-    """Contador de mobilidade otimizado para não instanciar objetos Pydantic."""
-    count = 0
-    for professor in TEAM_PROFESSORS[team_id]:
-        pos = find_professor(board, professor)
-        if pos is None: continue
-        
-        cur_row, cur_col = pos
-        cur_level = board[cur_row][cur_col].level
 
-        for dst_row, dst_col in adjacent_cells(cur_row, cur_col):
-            dst_cell = board[dst_row][dst_col]
-            if dst_cell.professor is not None: continue
-            if dst_cell.level == 4: continue
-            if dst_cell.level > cur_level + 1: continue
+def contar_jogadas(
+    tabuleiro: list[list[Cell]],
+    equipe: int,
+    posicoes: Optional[dict[str, tuple[int, int]]] = None,
+) -> int:
+    """Conta jogadas legais sem instanciar Pydantic (usado no fator mobilidade)."""
+    if posicoes is None:
+        posicoes = mapear_professores(tabuleiro)
 
-            if dst_cell.level == 3:
-                count += 1
+    total = 0
+    for prof in PROFS_POR_EQUIPE[equipe]:
+        origem = posicoes.get(prof)
+        if origem is None:
+            continue
+        ol, oc = origem
+        altura_atual = tabuleiro[ol][oc].level
+
+        for dl, dc in vizinhas(ol, oc):
+            destino = tabuleiro[dl][dc]
+            if destino.professor is not None:
                 continue
+            if destino.level >= ALTURA_MAXIMA:
+                continue
+            if destino.level > altura_atual + 1:
+                continue
+            if destino.level == ALTURA_VITORIA:
+                total += 1
+                continue
+            for ml, mc in vizinhas(dl, dc):
+                mentoria = tabuleiro[ml][mc]
+                eh_origem = (ml, mc) == (ol, oc)
+                if (mentoria.professor is None or eh_origem) and mentoria.level < ALTURA_MAXIMA:
+                    total += 1
+    return total
 
-            for men_row, men_col in adjacent_cells(dst_row, dst_col):
-                men_cell = board[men_row][men_col]
-                is_source = (men_row, men_col) == (cur_row, cur_col)
-                if (men_cell.professor is None or is_source) and men_cell.level < 4:
-                    count += 1
-    return count
 
-def apply_move(board: list[list[Cell]], move: PlayerTurnResponse) -> list[list[Cell]]:
-    """Simula um movimento via reatribuição explícita (Evita overhead de deepcopy)."""
-    # Cópia rasa: cria uma nova matriz de referências, permitindo mutação isolada
-    new_board = [row[:] for row in board] 
+def ordenar_jogadas(
+    tabuleiro: list[list[Cell]], jogadas: list[PlayerTurnResponse]
+) -> list[PlayerTurnResponse]:
+    """Heurística barata de ordenação: melhora muito a poda alpha-beta.
 
-    # 1. Encontra e remove o professor da posição antiga
-    old_pos = find_professor(board, move.professor)
-    if old_pos:
-        o_r, o_c = old_pos
-        new_board[o_r][o_c] = Cell(level=board[o_r][o_c].level, professor=None)
+    Tenta primeiro as jogadas de vitória e as que sobem mais alto.
+    """
+    def prioridade(j: PlayerTurnResponse):
+        destino = tabuleiro[j.move_to.row][j.move_to.col]
+        return (j.mentor_at is None, destino.level)
 
-    # 2. Move o professor para a nova posição
-    n_r, n_c = move.move_to.row, move.move_to.col
-    new_board[n_r][n_c] = Cell(level=board[n_r][n_c].level, professor=move.professor)
+    return sorted(jogadas, key=prioridade, reverse=True)
 
-    # 3. Aplica a mentoria (constrói um andar), se houver
-    if move.mentor_at:
-        m_r, m_c = move.mentor_at.row, move.mentor_at.col
-        curr_prof = new_board[m_r][m_c].professor # Usa o estado do new_board caso a célula seja a mesma de destino
-        new_board[m_r][m_c] = Cell(level=board[m_r][m_c].level + 1, professor=curr_prof)
-
-    return new_board
 
 # =========================================================
-# MÓDULO 2: AVALIAÇÃO DE ESTADO
+# SIMULAÇÃO DE JOGADA
 # =========================================================
-def evaluate_board(board: list[list[Cell]], team_id: int, opp_id: int) -> float:
-    """Avalia o estado do tabuleiro usando os pesos definidos."""
+def simular_jogada(
+    tabuleiro: list[list[Cell]], jogada: PlayerTurnResponse
+) -> list[list[Cell]]:
+    """Aplica a jogada numa cópia rasa do tabuleiro (sem deepcopy)."""
+    novo = [linha[:] for linha in tabuleiro]  # nova matriz de referências
+
+    # 1. Tira o professor da casa de origem
+    origem = localizar(tabuleiro, jogada.professor)
+    if origem:
+        ol, oc = origem
+        novo[ol][oc] = Cell(level=tabuleiro[ol][oc].level, professor=None)
+
+    # 2. Coloca o professor na casa de destino
+    dl, dc = jogada.move_to.row, jogada.move_to.col
+    novo[dl][dc] = Cell(level=tabuleiro[dl][dc].level, professor=jogada.professor)
+
+    # 3. Constrói um andar (mentoria), se houver
+    if jogada.mentor_at:
+        ml, mc = jogada.mentor_at.row, jogada.mentor_at.col
+        # usa o professor já presente em `novo` (a origem pode ter sido esvaziada)
+        prof_na_casa = novo[ml][mc].professor
+        novo[ml][mc] = Cell(level=tabuleiro[ml][mc].level + 1, professor=prof_na_casa)
+
+    return novo
+
+
+# =========================================================
+# AVALIAÇÃO DE ESTADO
+# =========================================================
+def avaliar(tabuleiro: list[list[Cell]], equipe: int) -> float:
+    """Pontua o tabuleiro do ponto de vista de `equipe` (quanto maior, melhor)."""
+    adversario = equipe_adversaria(equipe)
+    meus = PROFS_POR_EQUIPE[equipe]
+    deles = PROFS_POR_EQUIPE[adversario]
+
+    posicoes = mapear_professores(tabuleiro)
     score = 0.0
-    
-    for r in range(BOARD_SIZE):
-        for c in range(BOARD_SIZE):
-            cell = board[r][c]
-            if cell.professor is None:
-                continue
 
-            # Verifica se alguém já venceu
-            if cell.level == 3:
-                return WEIGHTS["win_move"] if cell.professor in TEAM_PROFESSORS[team_id] else -WEIGHTS["win_move"]
+    for prof, (l, c) in posicoes.items():
+        altura = tabuleiro[l][c].level
 
-            # Aplica pontuação de heurística posicional
-            if cell.professor in TEAM_PROFESSORS[team_id]:
-                score += cell.level * WEIGHTS["my_height"]
-                # Distância de Manhattan do centro
-                center_dist = abs(r - 2) + abs(c - 2)
-                score += (4 - center_dist) * WEIGHTS["center_control"]
-            elif cell.professor in TEAM_PROFESSORS[opp_id]:
-                score += cell.level * WEIGHTS["opp_height"]
+        # Se alguém já está no nível de vitória, o resultado está decidido
+        if altura == ALTURA_VITORIA:
+            return PESOS["vitoria"] if prof in meus else -PESOS["vitoria"]
 
-    # Fator de Mobilidade
-    score += (count_legal_moves(board, team_id) - count_legal_moves(board, opp_id)) * WEIGHTS["mobility"]
-    
+        if prof in meus:
+            score += altura * PESOS["minha_altura"]
+            dist_centro = abs(l - 2) + abs(c - 2)
+            score += (4 - dist_centro) * PESOS["controle_centro"]
+            # potencial de subida: casa livre exatamente um nível acima
+            for vl, vc in vizinhas(l, c):
+                viz = tabuleiro[vl][vc]
+                if viz.professor is None and viz.level == altura + 1 and viz.level < ALTURA_MAXIMA:
+                    score += PESOS["potencial_subida"]
+        elif prof in deles:
+            score += altura * PESOS["altura_adversario"]
+
+    # Fator de mobilidade (reaproveita o mapa de posições já calculado)
+    score += (
+        contar_jogadas(tabuleiro, equipe, posicoes)
+        - contar_jogadas(tabuleiro, adversario, posicoes)
+    ) * PESOS["mobilidade"]
+
     return score
 
-# =========================================================
-# MÓDULO 3: MOTOR MINIMAX
-# =========================================================
-def minimax(board: list[list[Cell]], depth: int, alpha: float, beta: float, is_maximizing: bool, team_id: int, opp_id: int) -> float:
-    """Busca em profundidade com Alpha-Beta Pruning."""
-    if depth == 0:
-        return evaluate_board(board, team_id, opp_id)
 
-    current_team = team_id if is_maximizing else opp_id
-    legal_moves = get_legal_moves(board, current_team)
-    
-    # Condição de terminalidade natural (sem movimentos válidos)
-    if not legal_moves:
-        return -WEIGHTS["win_move"] if is_maximizing else WEIGHTS["win_move"]
+# =========================================================
+# MOTOR DE BUSCA (NEGAMAX + ALPHA-BETA)
+# =========================================================
+def busca(
+    tabuleiro: list[list[Cell]],
+    profundidade: int,
+    alpha: float,
+    beta: float,
+    equipe: int,
+) -> float:
+    """Negamax com poda alpha-beta, sempre do ponto de vista de quem joga (`equipe`)."""
+    jogadas = jogadas_validas(tabuleiro, equipe)
 
-    if is_maximizing:
-        max_eval = -math.inf
-        for move in legal_moves:
-            simulated_board = apply_move(board, move)
-            
-            if move.mentor_at is None and simulated_board[move.move_to.row][move.move_to.col].level == 3:
-                return WEIGHTS["win_move"]
-                
-            eval_score = minimax(simulated_board, depth - 1, alpha, beta, False, team_id, opp_id)
-            max_eval = max(max_eval, eval_score)
-            alpha = max(alpha, eval_score)
-            if beta <= alpha:
-                break
-        return max_eval
-    else:
-        min_eval = math.inf
-        for move in legal_moves:
-            simulated_board = apply_move(board, move)
-            
-            if move.mentor_at is None and simulated_board[move.move_to.row][move.move_to.col].level == 3:
-                return -WEIGHTS["win_move"]
-                
-            eval_score = minimax(simulated_board, depth - 1, alpha, beta, True, team_id, opp_id)
-            min_eval = min(min_eval, eval_score)
-            beta = min(beta, eval_score)
-            if beta <= alpha:
-                break
-        return min_eval
+    # Sem jogadas legais = a equipe da vez perde
+    if not jogadas:
+        return -PESOS["vitoria"]
+
+    # Vitória imediata disponível (jogadas de vitória não constroem)
+    for jogada in jogadas:
+        if jogada.mentor_at is None:
+            return PESOS["vitoria"]
+
+    if profundidade == 0:
+        return avaliar(tabuleiro, equipe)
+
+    adversario = equipe_adversaria(equipe)
+    melhor = -math.inf
+    for jogada in ordenar_jogadas(tabuleiro, jogadas):
+        filho = simular_jogada(tabuleiro, jogada)
+        valor = -busca(filho, profundidade - 1, -beta, -alpha, adversario)
+        if valor > melhor:
+            melhor = valor
+        if melhor > alpha:
+            alpha = melhor
+        if alpha >= beta:
+            break
+    return melhor
+
+
+# =========================================================
+# INTERFACE DO BOT (nomes obrigatórios)
+# =========================================================
+def choose_setup(board: list[list[Cell]]) -> SetupResponse:
+    """Fase de posicionamento: prioriza o miolo do tabuleiro."""
+    livres = [
+        (l, c)
+        for l in range(GRID)
+        for c in range(GRID)
+        if board[l][c].level == 0 and board[l][c].professor is None
+    ]
+    centro = [(l, c) for l, c in livres if 1 <= l <= 3 and 1 <= c <= 3]
+    linha, coluna = random.choice(centro or livres)
+    return SetupResponse(row=linha, col=coluna)
+
 
 def choose_turn(board: list[list[Cell]], team_id: int) -> Optional[PlayerTurnResponse]:
-    """Decide a melhor jogada usando CSP (Filtro) e Minimax + Alpha-Beta."""
-    opp_id = 2 if team_id == 1 else 1
-    
-    legal_moves = get_legal_moves(board, team_id)
-    if not legal_moves:
+    """Decide a melhor jogada via filtro CSP + negamax com poda alpha-beta."""
+    jogadas = jogadas_validas(board, team_id)
+    if not jogadas:
         return None
 
-    # Avaliação de vitória imediata antes de expandir a árvore O(1)
-    for move in legal_moves:
-        if move.mentor_at is None:
-            return move
+    # 1) Vitória imediata, se existir — resposta O(1) por jogada
+    for jogada in jogadas:
+        if jogada.mentor_at is None:
+            return jogada
 
-    # Inicia a busca Minimax
-    SEARCH_DEPTH = 2 
-    best_move = None
-    best_score = -math.inf
-    alpha = -math.inf
-    beta = math.inf
+    # 2) Busca em profundidade.
+    #    2 = mesma profundidade do bot original (rápido e seguro).
+    #    Suba para 3 SE o limite de tempo da partida permitir — a ordenação de
+    #    jogadas torna isso viável, mas com Pydantic real pode levar alguns segundos.
+    PROFUNDIDADE = 2
+    adversario = equipe_adversaria(team_id)
 
-    for move in legal_moves:
-        simulated_board = apply_move(board, move)
-        move_score = minimax(simulated_board, SEARCH_DEPTH - 1, alpha, beta, False, team_id, opp_id)
-        
-        if move_score > best_score:
-            best_score = move_score
-            best_move = move
-            
-        alpha = max(alpha, best_score)
+    melhor_jogada: Optional[PlayerTurnResponse] = None
+    melhor_score = -math.inf
+    alpha, beta = -math.inf, math.inf
 
-    return best_move if best_move else random.choice(legal_moves)
+    for jogada in ordenar_jogadas(board, jogadas):
+        filho = simular_jogada(board, jogada)
+        score = -busca(filho, PROFUNDIDADE - 1, -beta, -alpha, adversario)
+        if score > melhor_score:
+            melhor_score = score
+            melhor_jogada = jogada
+        if melhor_score > alpha:
+            alpha = melhor_score
+
+    return melhor_jogada or random.choice(jogadas)
